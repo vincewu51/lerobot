@@ -24,6 +24,7 @@ import numpy as np
 import time
 import torch
 import traceback
+import cv2
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -92,55 +93,98 @@ class ACTWebSocketServer:
 
     def preprocess_observation(self, obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
-        Convert OmniGibson observation format to LeRobot format.
+        Convert OmniGibson observation format to LeRobot format for b1k-task0000 model.
 
-        OmniGibson obs format (from eval.py):
-        {
-            "robot_r1::head_camera::rgb": np.array [H, W, 3] uint8,
-            "robot_r1::left_wrist_camera::rgb": np.array [H, W, 3] uint8,
-            "robot_r1::right_wrist_camera::rgb": np.array [H, W, 3] uint8,
-            "robot_r1::proprioception": np.array [proprio_dim] float32,
-            "robot_r1::cam_rel_poses": np.array [21] float32 (7 per camera),
-            "task_id": np.array [1] int64,
-            ... (other modalities)
-        }
-
-        LeRobot format:
-        {
-            "observation.images.top": torch.Tensor [B=1, C=3, H, W] float32 [0, 1],
-            "observation.state": torch.Tensor [B=1, state_dim] float32,
-            ...
-        }
+        Expected model inputs:
+        - observation.images.rgb.{left_wrist,right_wrist,head}
+        - observation.images.depth.{left_wrist,right_wrist,head}
+        - observation.images.seg_instance_id.{left_wrist,right_wrist,head}
+        - observation.cam_rel_poses: [21]
+        - observation.state: [256] (proprioception)
+        - observation.task_info: [46]
         """
-        # TODO: Adapt this mapping based on your specific setup
-        # This is a template - you'll need to customize based on:
-        # 1. Your camera names in OmniGibson
-        # 2. Your policy's expected observation keys
-        # 3. Image resolution requirements
-
         lerobot_obs = {}
 
-        # Convert images: uint8 [H,W,3] -> float32 [1,3,H,W] in range [0,1]
-        for camera_key in ["head_camera", "left_wrist_camera", "right_wrist_camera"]:
-            omnigibson_key = f"robot_r1::{camera_key}::rgb"
-            if omnigibson_key in obs:
-                img = obs[omnigibson_key]  # [H, W, 3] uint8
-                # Convert to float [0, 1]
-                img = img.astype(np.float32) / 255.0
-                # Transpose to [C, H, W] and add batch dimension
-                img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+        # Camera mapping: OmniGibson -> LeRobot format
+        camera_mapping = {
+            "left_wrist_camera": ("left_wrist", (480, 480)),
+            "right_wrist_camera": ("right_wrist", (480, 480)),
+            "head_camera": ("head", (720, 720)),
+        }
 
-                # Map to LeRobot feature names
-                # TODO: Customize this mapping for your model
-                if camera_key == "head_camera":
-                    lerobot_obs["observation.images.top"] = img.to(self.device)
-                elif camera_key == "left_wrist_camera":
-                    lerobot_obs["observation.images.wrist"] = img.to(self.device)
+        # Modality mapping: OmniGibson suffix -> LeRobot modality name
+        modality_mapping = {
+            "rgb": "rgb",
+            "depth": "depth",
+            "seg_instance_id": "seg_instance_id",
+        }
 
-        # Convert proprioception/state
+        # Process all image modalities (RGB, depth, segmentation)
+        for og_camera, (lr_camera, target_size) in camera_mapping.items():
+            for og_modality, lr_modality in modality_mapping.items():
+                og_key = f"robot_r1::{og_camera}::{og_modality}"
+                lr_key = f"observation.images.{lr_modality}.{lr_camera}"
+
+                if og_key in obs:
+                    img = obs[og_key]  # [H, W, 3] or [H, W, C]
+
+                    # Resize to target resolution
+                    if img.shape[:2] != target_size:
+                        img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
+
+                    # Normalize to [0, 1] if uint8
+                    if img.dtype == np.uint8:
+                        img = img.astype(np.float32) / 255.0
+                    else:
+                        img = img.astype(np.float32)
+
+                    # Ensure 3 channels (depth might be single channel)
+                    if img.ndim == 2:
+                        img = np.stack([img, img, img], axis=-1)  # [H, W, 3]
+                    elif img.shape[-1] == 1:
+                        img = np.repeat(img, 3, axis=-1)
+
+                    # Convert to tensor: [H, W, 3] -> [1, 3, H, W]
+                    img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+                    lerobot_obs[lr_key] = img_tensor.to(self.device)
+                else:
+                    # If modality not available, create zero tensor with correct shape
+                    logger.warning(f"Missing observation: {og_key}, using zeros")
+                    img_tensor = torch.zeros(1, 3, target_size[0], target_size[1])
+                    lerobot_obs[lr_key] = img_tensor.to(self.device)
+
+        # Camera relative poses [21] (7 per camera: xyz position + xyzw quaternion)
+        if "robot_r1::cam_rel_poses" in obs:
+            cam_rel_poses = torch.from_numpy(obs["robot_r1::cam_rel_poses"]).unsqueeze(0)  # [1, 21]
+            lerobot_obs["observation.cam_rel_poses"] = cam_rel_poses.to(self.device).float()
+        else:
+            logger.warning("Missing observation.cam_rel_poses, using zeros")
+            lerobot_obs["observation.cam_rel_poses"] = torch.zeros(1, 21).to(self.device)
+
+        # Proprioception state [256]
         if "robot_r1::proprioception" in obs:
             state = torch.from_numpy(obs["robot_r1::proprioception"]).unsqueeze(0)  # [1, state_dim]
-            lerobot_obs["observation.state"] = state.to(self.device)
+            lerobot_obs["observation.state"] = state.to(self.device).float()
+        else:
+            logger.warning("Missing observation.state, using zeros")
+            lerobot_obs["observation.state"] = torch.zeros(1, 256).to(self.device)
+
+        # Task info [46] - this may need special handling
+        # Option 1: If task_id is available, create one-hot or embedding
+        if "task_id" in obs:
+            task_id = obs["task_id"]
+            # For now, create a simple one-hot encoding (assuming 46 tasks)
+            # You may need to adjust this based on actual task encoding
+            task_info = np.zeros(46, dtype=np.float32)
+            if isinstance(task_id, np.ndarray):
+                task_id = int(task_id.item())
+            if task_id < 46:
+                task_info[task_id] = 1.0
+            lerobot_obs["observation.task_info"] = torch.from_numpy(task_info).unsqueeze(0).to(self.device)
+        else:
+            # Option 2: Use zeros if no task info available
+            logger.warning("Missing observation.task_info, using zeros")
+            lerobot_obs["observation.task_info"] = torch.zeros(1, 46).to(self.device)
 
         return lerobot_obs
 
