@@ -146,12 +146,11 @@ class GrootConfig(PreTrainedConfig):
         else:
             state_shape = self.input_features["observation.state"].shape
             state_dim = state_shape[0] if state_shape else 0
-            # Note: Processor will clip state to max_state_dim, so we allow larger state_dim in dataset
-            # if state_dim > self.max_state_dim:
-            #     raise ValueError(
-            #         f"State dimension {state_dim} exceeds max_state_dim {self.max_state_dim}. "
-            #         f"Either reduce state dimension or increase max_state_dim in config."
-            #     )
+            if state_dim > self.max_state_dim:
+                raise ValueError(
+                    f"State dimension {state_dim} exceeds max_state_dim {self.max_state_dim}. "
+                    f"Either reduce state dimension or increase max_state_dim in config."
+                )
 
         if "action" not in self.output_features:
             action_feature = PolicyFeature(

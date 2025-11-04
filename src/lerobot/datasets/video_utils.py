@@ -348,8 +348,8 @@ def encode_video_frames(
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
-    dummy_image = Image.open(input_list[0])
-    width, height = dummy_image.size
+    with Image.open(input_list[0]) as dummy_image:
+        width, height = dummy_image.size
 
     # Define video codec options
     video_options = {}
@@ -379,11 +379,12 @@ def encode_video_frames(
 
         # Loop through input frames and encode them
         for input_data in input_list:
-            input_image = Image.open(input_data).convert("RGB")
-            input_frame = av.VideoFrame.from_image(input_image)
-            packet = output_stream.encode(input_frame)
-            if packet:
-                output.mux(packet)
+            with Image.open(input_data) as input_image:
+                input_image = input_image.convert("RGB")
+                input_frame = av.VideoFrame.from_image(input_image)
+                packet = output_stream.encode(input_frame)
+                if packet:
+                    output.mux(packet)
 
         # Flush the encoder
         packet = output_stream.encode()
@@ -457,11 +458,9 @@ def concatenate_video_files(
             stream_map[input_stream.index] = output_container.add_stream_from_template(
                 template=input_stream, opaque=True
             )
-            stream_map[
-                input_stream.index
-            ].time_base = (
-                input_stream.time_base
-            )  # set the time base to the input stream time base (missing in the codec context)
+
+            # set the time base to the input stream time base (missing in the codec context)
+            stream_map[input_stream.index].time_base = input_stream.time_base
 
     # Demux + remux packets (no re-encode)
     for packet in input_container.demux():
@@ -649,6 +648,9 @@ class VideoEncodingManager:
                 f"from episode {start_ep} to {end_ep - 1}"
             )
             self.dataset._batch_save_episode_video(start_ep, end_ep)
+
+        # Finalize the dataset to properly close all writers
+        self.dataset.finalize()
 
         # Clean up episode images if recording was interrupted
         if exc_type is not None:

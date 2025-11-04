@@ -272,20 +272,7 @@ class GrootPackInputsStep(ProcessorStep):
         if not img_keys and "observation.image" in obs:
             img_keys = ["observation.image"]
         if img_keys:
-            import cv2
-            cams_raw = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
-            # Resize head camera (720x720) to match wrist cameras (480x480)
-            target_h, target_w = 480, 480
-            cams = []
-            for cam in cams_raw:
-                # cam shape: (B, H, W, C)
-                resized_batch = []
-                for i in range(cam.shape[0]):
-                    img = cam[i]  # (H, W, C)
-                    if img.shape[0] != target_h or img.shape[1] != target_w:
-                        img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                    resized_batch.append(img)
-                cams.append(np.stack(resized_batch, axis=0))  # (B, target_h, target_w, C)
+            cams = [_to_uint8_np_bhwc(obs[k]) for k in img_keys]
             video = np.stack(cams, axis=1)  # (B, V, H, W, C)
             video = np.expand_dims(video, axis=1)  # (B, 1, V, H, W, C)
             # GR00T validates that video.shape[3] == 3 (channels), so reorder to (B, T, V, C, H, W)
