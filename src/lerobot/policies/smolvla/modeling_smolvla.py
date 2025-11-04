@@ -153,10 +153,16 @@ def pad_vector(vector, new_dim):
         return vector
     shape = list(vector.shape)
     current_dim = shape[-1]
-    shape[-1] = new_dim
-    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
-    new_vector[..., :current_dim] = vector
-    return new_vector
+
+    if current_dim > new_dim:
+        # Clip to new_dim if vector is larger
+        return vector[..., :new_dim]
+    else:
+        # Pad with zeros if vector is smaller
+        shape[-1] = new_dim
+        new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+        new_vector[..., :current_dim] = vector
+        return new_vector
 
 
 def normalize(x, min_val, max_val):

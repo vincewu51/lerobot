@@ -547,7 +547,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
-        tolerance_s: float = 1e-4,
+        tolerance_s: float = 0.15,
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
@@ -963,6 +963,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
             frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            if frames is None:
+                # Skip this sample due to timestamp tolerance violation
+                return None
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -983,32 +986,45 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> dict:
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
-        item = self.hf_dataset[idx]
-        ep_idx = item["episode_index"].item()
 
-        query_indices = None
-        if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
-            query_result = self._query_hf_dataset(query_indices)
-            item = {**item, **padding}
-            for key, val in query_result.items():
-                item[key] = val
+        # Retry logic to handle samples with timestamp tolerance violations
+        max_retries = 10
+        for retry in range(max_retries):
+            try_idx = idx if retry == 0 else (idx + retry * 1000) % len(self)
 
-        if len(self.meta.video_keys) > 0:
-            current_ts = item["timestamp"].item()
-            query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-            item = {**video_frames, **item}
+            item = self.hf_dataset[try_idx]
+            ep_idx = item["episode_index"].item()
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+            query_indices = None
+            if self.delta_indices is not None:
+                query_indices, padding = self._get_query_indices(try_idx, ep_idx)
+                query_result = self._query_hf_dataset(query_indices)
+                item = {**item, **padding}
+                for key, val in query_result.items():
+                    item[key] = val
 
-        # Add task as a string
-        task_idx = item["task_index"].item()
-        item["task"] = self.meta.tasks.iloc[task_idx].name
-        return item
+            if len(self.meta.video_keys) > 0:
+                current_ts = item["timestamp"].item()
+                query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+                video_frames = self._query_videos(query_timestamps, ep_idx)
+                if video_frames is None:
+                    # Try next index
+                    continue
+                item = {**video_frames, **item}
+
+            if self.image_transforms is not None:
+                image_keys = self.meta.camera_keys
+                for cam in image_keys:
+                    item[cam] = self.image_transforms(item[cam])
+
+            # Add task as a string
+            task_idx = item["task_index"].item()
+            item["task"] = self.meta.tasks.iloc[task_idx].name
+            return item
+
+        # If all retries failed, return None (will be filtered by collate_fn)
+        logging.warning(f"Failed to get valid sample after {max_retries} retries for idx={idx}")
+        return None
 
     def __repr__(self):
         feature_keys = list(self.features)
@@ -1448,7 +1464,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         root: str | Path | None = None,
         robot_type: str | None = None,
         use_videos: bool = True,
-        tolerance_s: float = 1e-4,
+        tolerance_s: float = 0.15,
         image_writer_processes: int = 0,
         image_writer_threads: int = 0,
         video_backend: str | None = None,
@@ -1515,7 +1531,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         super().__init__()
         self.repo_ids = repo_ids
         self.root = Path(root) if root else HF_LEROBOT_HOME
-        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
+        self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.15)
         # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
         # are handled by this class.
         self._datasets = [

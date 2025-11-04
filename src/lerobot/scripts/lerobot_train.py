@@ -281,6 +281,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
+    # Track skipped batches for logging
+    skipped_batches_count = [0]  # Use list to allow mutation in nested function
+
+    def collate_fn_skip_none(batch):
+        """Custom collate function that skips entire batch if any item is None."""
+        # If ANY item is None, skip the entire batch to maintain consistent batch size across ranks
+        if any(item is None for item in batch):
+            num_none = sum(1 for item in batch if item is None)
+            skipped_batches_count[0] += 1
+            if skipped_batches_count[0] % 10 == 0:
+                logging.warning(
+                    f"Skipped {skipped_batches_count[0]} batches total due to timestamp tolerance violations "
+                    f"(last batch had {num_none}/{len(batch)} None items)"
+                )
+            return None
+        return torch.utils.data.default_collate(batch)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -288,8 +305,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
         pin_memory=device.type == "cuda",
-        drop_last=False,
+        drop_last=True,  # Set to True to ensure consistent batch sizes when filtering None values
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        collate_fn=collate_fn_skip_none,
     )
 
     # Prepare everything with accelerator
@@ -326,6 +344,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        # Skip if batch is None (all samples were filtered out due to tolerance violations)
+        if batch is None:
+            logging.warning("Skipping batch due to all samples being filtered out (timestamp tolerance violations)")
+            continue
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
