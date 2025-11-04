@@ -65,7 +65,13 @@ class ACTWebSocketServer:
         # Load policy
         logger.info(f"Loading {config.policy_type} policy from {config.pretrained_name_or_path}")
         policy_class = get_policy_class(config.policy_type)
-        self.policy = policy_class.from_pretrained(config.pretrained_name_or_path)
+
+        # Load dataset stats from preprocessor file if it exists
+        dataset_stats = self._load_dataset_stats(config.pretrained_name_or_path)
+        if dataset_stats is not None:
+            logger.info("Loaded dataset stats from preprocessor file")
+
+        self.policy = policy_class.from_pretrained(config.pretrained_name_or_path, dataset_stats=dataset_stats)
         self.policy.to(self.device)
         self.policy.eval()
 
@@ -73,15 +79,73 @@ class ACTWebSocketServer:
         logger.info(f"Policy expects image features: {self.policy.config.image_features}")
 
         # Metadata to send to client
+        # Convert image_features to serializable format (list of feature names)
+        image_feature_names = list(self.policy.config.image_features.keys()) if hasattr(self.policy.config, 'image_features') else []
+
         self._metadata = {
             "policy_type": config.policy_type,
             "pretrained_name_or_path": config.pretrained_name_or_path,
             "device": str(self.device),
-            "image_features": self.policy.config.image_features,
+            "image_features": image_feature_names,
         }
 
         # Episode state
         self.reset()
+
+        # Track whether we've warned about missing modalities
+        self._warned_missing_depth_seg = False
+
+    def _load_dataset_stats(self, model_path: str) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
+        """Load dataset stats from preprocessor safetensors file"""
+        from safetensors.torch import load_file
+        from pathlib import Path
+
+        model_path = Path(model_path)
+        stats_file = model_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+
+        if not stats_file.exists():
+            logger.warning(f"No stats file found at {stats_file}")
+            return None
+
+        try:
+            # Load all stats from the file
+            all_stats = load_file(str(stats_file))
+
+            # Reorganize stats into the format expected by the policy:
+            # {feature_name: {'mean': tensor, 'std': tensor, 'min': tensor, 'max': tensor, ...}}
+            dataset_stats = {}
+
+            # Extract unique feature names
+            feature_names = set()
+            for key in all_stats.keys():
+                # Keys are like "observation.state.mean", "observation.state.std", etc.
+                feature_name = '.'.join(key.split('.')[:-1])  # Remove the stat type suffix
+                feature_names.add(feature_name)
+
+            # Organize stats by feature
+            for feature_name in feature_names:
+                dataset_stats[feature_name] = {}
+                for stat_type in ['mean', 'std', 'min', 'max', 'q01', 'q99', 'count']:
+                    stat_key = f"{feature_name}.{stat_type}"
+                    if stat_key in all_stats:
+                        dataset_stats[feature_name][stat_type] = all_stats[stat_key]
+
+            # Add dummy stats for observation.task_info if missing (common issue with task embeddings)
+            if "observation.task_info" not in dataset_stats:
+                logger.warning("observation.task_info stats not found, creating dummy stats")
+                # Create dummy stats (identity normalization: mean=0, std=1)
+                task_info_dim = 46  # From config
+                dataset_stats["observation.task_info"] = {
+                    "mean": torch.zeros(task_info_dim),
+                    "std": torch.ones(task_info_dim),
+                }
+
+            logger.info(f"Loaded stats for features: {list(dataset_stats.keys())}")
+            return dataset_stats
+
+        except Exception as e:
+            logger.error(f"Error loading dataset stats: {e}")
+            return None
 
     def reset(self):
         """Reset policy state for new episode"""
@@ -89,6 +153,7 @@ class ACTWebSocketServer:
         # for action chunking. Reset here if needed.
         self.action_chunk = None
         self.chunk_idx = 0
+        self._warned_missing_depth_seg = False
         logger.info("Policy state reset")
 
     def preprocess_observation(self, obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
@@ -106,10 +171,11 @@ class ACTWebSocketServer:
         lerobot_obs = {}
 
         # Camera mapping: OmniGibson -> LeRobot format
+        # Using the actual OmniGibson R1Pro camera names (note: double robot_r1:: in the full key)
         camera_mapping = {
-            "left_wrist_camera": ("left_wrist", (480, 480)),
-            "right_wrist_camera": ("right_wrist", (480, 480)),
-            "head_camera": ("head", (720, 720)),
+            "robot_r1::robot_r1:left_realsense_link:Camera:0": ("left_wrist", (480, 480)),
+            "robot_r1::robot_r1:right_realsense_link:Camera:0": ("right_wrist", (480, 480)),
+            "robot_r1::robot_r1:zed_link:Camera:0": ("head", (720, 720)),
         }
 
         # Modality mapping: OmniGibson suffix -> LeRobot modality name
@@ -120,9 +186,10 @@ class ACTWebSocketServer:
         }
 
         # Process all image modalities (RGB, depth, segmentation)
+        # Note: OmniGibson only sends RGB by default, depth and seg are not available
         for og_camera, (lr_camera, target_size) in camera_mapping.items():
             for og_modality, lr_modality in modality_mapping.items():
-                og_key = f"robot_r1::{og_camera}::{og_modality}"
+                og_key = f"{og_camera}::{og_modality}"  # Keys already include robot_r1::
                 lr_key = f"observation.images.{lr_modality}.{lr_camera}"
 
                 if og_key in obs:
@@ -138,18 +205,29 @@ class ACTWebSocketServer:
                     else:
                         img = img.astype(np.float32)
 
-                    # Ensure 3 channels (depth might be single channel)
+                    # Handle different channel counts
                     if img.ndim == 2:
+                        # Single channel (e.g., depth) -> replicate to 3 channels
                         img = np.stack([img, img, img], axis=-1)  # [H, W, 3]
                     elif img.shape[-1] == 1:
+                        # Single channel -> replicate to 3 channels
                         img = np.repeat(img, 3, axis=-1)
+                    elif img.shape[-1] == 4:
+                        # RGBA -> drop alpha channel, keep only RGB
+                        img = img[:, :, :3]
 
                     # Convert to tensor: [H, W, 3] -> [1, 3, H, W]
                     img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
                     lerobot_obs[lr_key] = img_tensor.to(self.device)
                 else:
                     # If modality not available, create zero tensor with correct shape
-                    logger.warning(f"Missing observation: {og_key}, using zeros")
+                    # Only warn once for depth/seg since OmniGibson doesn't send them by default
+                    if og_modality in ["depth", "seg_instance_id"] and not self._warned_missing_depth_seg:
+                        logger.warning(f"Depth and segmentation images not available from OmniGibson, using zeros")
+                        self._warned_missing_depth_seg = True
+                    elif og_modality == "rgb":
+                        logger.warning(f"Missing RGB observation: {og_key}, using zeros")
+
                     img_tensor = torch.zeros(1, 3, target_size[0], target_size[1])
                     lerobot_obs[lr_key] = img_tensor.to(self.device)
 
@@ -162,11 +240,11 @@ class ACTWebSocketServer:
             lerobot_obs["observation.cam_rel_poses"] = torch.zeros(1, 21).to(self.device)
 
         # Proprioception state [256]
-        if "robot_r1::proprioception" in obs:
-            state = torch.from_numpy(obs["robot_r1::proprioception"]).unsqueeze(0)  # [1, state_dim]
+        if "robot_r1::proprio" in obs:
+            state = torch.from_numpy(obs["robot_r1::proprio"]).unsqueeze(0)  # [1, state_dim]
             lerobot_obs["observation.state"] = state.to(self.device).float()
         else:
-            logger.warning("Missing observation.state, using zeros")
+            logger.warning("Missing observation.state (robot_r1::proprio), using zeros")
             lerobot_obs["observation.state"] = torch.zeros(1, 256).to(self.device)
 
         # Task info [46] - this may need special handling
