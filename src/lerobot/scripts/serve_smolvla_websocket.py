@@ -22,6 +22,7 @@ import http
 import logging
 import msgpack
 import numpy as np
+import sys
 import time
 import torch
 import traceback
@@ -37,6 +38,10 @@ except ImportError:
     import websockets.server as _server
 
 from lerobot.policies.factory import get_policy_class
+
+# Import state filtering function
+sys.path.insert(0, str(Path.home() / "workspace/smolvla_training"))
+from filter_allowed_state import filter_state_top32
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +86,7 @@ class SmolVLAWebSocketServer:
         logger.info(f"Policy loaded successfully on {self.device}")
         logger.info(f"Policy expects image features: {self.policy.config.input_features}")
         logger.info(f"Using task description: '{config.task}'")
+        logger.info(f"State filtering: 256 dimensions -> 32 dimensions (top features for manipulation)")
 
         # Metadata to send to client
         # Convert image_features to serializable format (list of feature names)
@@ -140,7 +146,7 @@ class SmolVLAWebSocketServer:
             if "observation.task_info" not in dataset_stats:
                 logger.warning("observation.task_info stats not found, creating dummy stats")
                 # Create dummy stats (identity normalization: mean=0, std=1)
-                task_info_dim = 46  # From config
+                task_info_dim = 382  # From config
                 dataset_stats["observation.task_info"] = {
                     "mean": torch.zeros(task_info_dim),
                     "std": torch.ones(task_info_dim),
@@ -170,8 +176,8 @@ class SmolVLAWebSocketServer:
         - observation.images.depth.{left_wrist,right_wrist,head}
         - observation.images.seg_instance_id.{left_wrist,right_wrist,head}
         - observation.cam_rel_poses: [21]
-        - observation.state: [256] (proprioception)
-        - observation.task_info: [46]
+        - observation.state: [32] (proprioception, filtered from 256 to top 32 features)
+        - observation.task_info: [382]
         - task: string (task description for SmolVLA)
         """
         lerobot_obs = {}
@@ -245,30 +251,33 @@ class SmolVLAWebSocketServer:
             logger.warning("Missing observation.cam_rel_poses, using zeros")
             lerobot_obs["observation.cam_rel_poses"] = torch.zeros(1, 21).to(self.device)
 
-        # Proprioception state [256]
+        # Proprioception state [256] -> filtered to [32]
         if "robot_r1::proprio" in obs:
-            state = torch.from_numpy(obs["robot_r1::proprio"]).unsqueeze(0)  # [1, state_dim]
+            state_256 = obs["robot_r1::proprio"]  # [256]
+            # Filter to 32 most important dimensions
+            state_32 = filter_state_top32(state_256)  # [32]
+            state = torch.from_numpy(state_32).unsqueeze(0)  # [1, 32]
             lerobot_obs["observation.state"] = state.to(self.device).float()
         else:
             logger.warning("Missing observation.state (robot_r1::proprio), using zeros")
-            lerobot_obs["observation.state"] = torch.zeros(1, 256).to(self.device)
+            lerobot_obs["observation.state"] = torch.zeros(1, 32).to(self.device)
 
-        # Task info [46] - this may need special handling
+        # Task info [382] - this may need special handling
         # Option 1: If task_id is available, create one-hot or embedding
         if "task_id" in obs:
             task_id = obs["task_id"]
-            # For now, create a simple one-hot encoding (assuming 46 tasks)
+            # For now, create a simple one-hot encoding (assuming 382 tasks max)
             # You may need to adjust this based on actual task encoding
-            task_info = np.zeros(46, dtype=np.float32)
+            task_info = np.zeros(382, dtype=np.float32)
             if isinstance(task_id, np.ndarray):
                 task_id = int(task_id.item())
-            if task_id < 46:
+            if task_id < 382:
                 task_info[task_id] = 1.0
             lerobot_obs["observation.task_info"] = torch.from_numpy(task_info).unsqueeze(0).to(self.device)
         else:
             # Option 2: Use zeros if no task info available
             logger.warning("Missing observation.task_info, using zeros")
-            lerobot_obs["observation.task_info"] = torch.zeros(1, 46).to(self.device)
+            lerobot_obs["observation.task_info"] = torch.zeros(1, 382).to(self.device)
 
         # Add task description for SmolVLA (this will be tokenized by the preprocessor)
         lerobot_obs["task"] = self.config.task
