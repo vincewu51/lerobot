@@ -145,6 +145,62 @@ def resize_with_pad(img, width, height, pad_value=-1):
     return padded_img
 
 
+def split_image(img, max_tile_size):
+    """
+    Split an image into tiles for better visual detail processing.
+
+    Similar to SmolVLM2's image splitting, this divides large images into
+    smaller tiles plus a downscaled global view.
+
+    Args:
+        img: Image tensor of shape (B, C, H, W)
+        max_tile_size: Maximum size for each tile dimension
+
+    Returns:
+        tiles: List of image tiles including global view
+        num_rows: Number of rows in the tile grid
+        num_cols: Number of columns in the tile grid
+    """
+    if img.ndim != 4:
+        raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+
+    batch_size, channels, height, width = img.shape
+
+    # Calculate number of tiles needed
+    num_rows = math.ceil(height / max_tile_size)
+    num_cols = math.ceil(width / max_tile_size)
+
+    tiles = []
+
+    # Extract tiles from the image
+    for row in range(num_rows):
+        for col in range(num_cols):
+            start_h = row * max_tile_size
+            start_w = col * max_tile_size
+            end_h = min(start_h + max_tile_size, height)
+            end_w = min(start_w + max_tile_size, width)
+
+            # Extract tile
+            tile = img[:, :, start_h:end_h, start_w:end_w]
+
+            # Pad tile to max_tile_size if needed
+            tile_h, tile_w = tile.shape[2:]
+            if tile_h < max_tile_size or tile_w < max_tile_size:
+                pad_h = max_tile_size - tile_h
+                pad_w = max_tile_size - tile_w
+                tile = F.pad(tile, (0, pad_w, 0, pad_h), value=-1)
+
+            tiles.append(tile)
+
+    # Add global view (downscaled version of full image)
+    global_view = F.interpolate(
+        img, size=(max_tile_size, max_tile_size), mode="bilinear", align_corners=False
+    )
+    tiles.append(global_view)
+
+    return tiles, num_rows, num_cols
+
+
 def pad_vector(vector, new_dim):
     """Can be (batch_size x sequence_length x features_dimension)
     or (batch_size x features_dimension)
@@ -350,6 +406,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
+
+        If do_image_splitting is enabled, images will be split into tiles for better visual detail.
         """
         images = []
         img_masks = []
@@ -375,8 +433,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 mask = batch[f"{key}_padding_mask"].bool()
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+
+            # Apply image tiling if enabled
+            if self.config.do_image_splitting:
+                tiles, num_rows, num_cols = split_image(img, self.config.max_tile_size)
+                # Add each tile as a separate image
+                for tile in tiles:
+                    images.append(tile)
+                    img_masks.append(mask)  # Use same mask for all tiles
+            else:
+                images.append(img)
+                img_masks.append(mask)
 
         # Create image features not present in the batch
         # as fully 0 padded images.

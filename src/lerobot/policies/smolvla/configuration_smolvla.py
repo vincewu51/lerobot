@@ -46,6 +46,12 @@ class SmolVLAConfig(PreTrainedConfig):
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
+    # Image tiling configuration
+    # Enable image splitting/tiling for better visual detail at the cost of slower inference
+    do_image_splitting: bool = False
+    # Maximum size for each image tile (default 512 matches the resize size)
+    max_tile_size: int = 512
+
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
