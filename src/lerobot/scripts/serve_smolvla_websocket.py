@@ -146,7 +146,13 @@ class SmolVLAWebSocketServer:
             if "observation.task_info" not in dataset_stats:
                 logger.warning("observation.task_info stats not found, creating dummy stats")
                 # Create dummy stats (identity normalization: mean=0, std=1)
-                task_info_dim = 382  # From config
+                # Get dimension from policy config - input_features returns PolicyFeature objects
+                task_info_feature = self.policy.config.input_features.get("observation.task_info")
+                if task_info_feature is not None:
+                    task_info_dim = task_info_feature.shape[0]
+                else:
+                    task_info_dim = 382  # Default fallback
+                logger.info(f"Using task_info dimension from config: {task_info_dim}")
                 dataset_stats["observation.task_info"] = {
                     "mean": torch.zeros(task_info_dim),
                     "std": torch.ones(task_info_dim),
@@ -169,15 +175,15 @@ class SmolVLAWebSocketServer:
 
     def preprocess_observation(self, obs: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
         """
-        Convert OmniGibson observation format to LeRobot format for b1k-task0000 model.
+        Convert OmniGibson observation format to LeRobot format for SmolVLA models.
 
         Expected model inputs:
         - observation.images.rgb.{left_wrist,right_wrist,head}
-        - observation.images.depth.{left_wrist,right_wrist,head}
-        - observation.images.seg_instance_id.{left_wrist,right_wrist,head}
+        - observation.images.depth.{left_wrist,right_wrist,head} (if in config)
+        - observation.images.seg_instance_id.{left_wrist,right_wrist,head} (if in config)
         - observation.cam_rel_poses: [21]
         - observation.state: [32] (proprioception, filtered from 256 to top 32 features)
-        - observation.task_info: [382]
+        - observation.task_info: [N] (dimension from policy config, e.g., 46, 58, etc.)
         - task: string (task description for SmolVLA)
         """
         lerobot_obs = {}
@@ -262,22 +268,30 @@ class SmolVLAWebSocketServer:
             logger.warning("Missing observation.state (robot_r1::proprio), using zeros")
             lerobot_obs["observation.state"] = torch.zeros(1, 32).to(self.device)
 
-        # Task info [382] - this may need special handling
+        # Task info - dimension from policy config
+        # Get task_info dimension from policy config - input_features returns PolicyFeature objects
+        task_info_feature = self.policy.config.input_features.get("observation.task_info")
+        if task_info_feature is not None:
+            task_info_dim = task_info_feature.shape[0]
+        else:
+            task_info_dim = 382  # Default fallback
+
         # Option 1: If task_id is available, create one-hot or embedding
         if "task_id" in obs:
             task_id = obs["task_id"]
-            # For now, create a simple one-hot encoding (assuming 382 tasks max)
-            # You may need to adjust this based on actual task encoding
-            task_info = np.zeros(382, dtype=np.float32)
+            # Create a simple one-hot encoding
+            task_info = np.zeros(task_info_dim, dtype=np.float32)
             if isinstance(task_id, np.ndarray):
                 task_id = int(task_id.item())
-            if task_id < 382:
+            if task_id < task_info_dim:
                 task_info[task_id] = 1.0
+            else:
+                logger.warning(f"task_id {task_id} >= task_info_dim {task_info_dim}, using zeros")
             lerobot_obs["observation.task_info"] = torch.from_numpy(task_info).unsqueeze(0).to(self.device)
         else:
             # Option 2: Use zeros if no task info available
-            logger.warning("Missing observation.task_info, using zeros")
-            lerobot_obs["observation.task_info"] = torch.zeros(1, 382).to(self.device)
+            logger.warning(f"Missing observation.task_info, using zeros [{task_info_dim}]")
+            lerobot_obs["observation.task_info"] = torch.zeros(1, task_info_dim).to(self.device)
 
         # Add task description for SmolVLA (this will be tokenized by the preprocessor)
         lerobot_obs["task"] = self.config.task
