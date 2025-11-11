@@ -553,6 +553,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        gpu_pool=None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -678,6 +679,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
+        self.gpu_pool = gpu_pool
 
         # Unused attributes
         self.image_writer = None
@@ -962,7 +964,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend,
+                                       gpu_pool=getattr(self, 'gpu_pool', None))
             if frames is None:
                 # Skip this sample due to timestamp tolerance violation
                 return None

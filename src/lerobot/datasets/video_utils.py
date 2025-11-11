@@ -48,6 +48,7 @@ def decode_video_frames(
     timestamps: list[float],
     tolerance_s: float,
     backend: str | None = None,
+    gpu_pool=None,
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -66,7 +67,7 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, gpu_pool=gpu_pool)
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -193,7 +194,8 @@ class VideoDecoderCache:
         with self._lock:
             if video_path not in self._cache:
                 file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                # Use GPU decoding with worker_init_fn to initialize CUDA per worker
+                decoder = VideoDecoder(file_handle, device="cuda", seek_mode="approximate")
                 self._cache[video_path] = (decoder, file_handle)
 
             return self._cache[video_path][0]
@@ -226,6 +228,7 @@ def decode_video_frames_torchcodec(
     tolerance_s: float,
     log_loaded_timestamps: bool = False,
     decoder_cache: VideoDecoderCache | None = None,
+    gpu_pool=None,
 ) -> torch.Tensor:
     """Loads frames associated with the requested timestamps of a video using torchcodec.
 
@@ -244,6 +247,34 @@ def decode_video_frames_torchcodec(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
+    # If using GPU pool, use it for decoding
+    if gpu_pool is not None:
+        from torch.utils.data import get_worker_info
+
+        # Get worker ID
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        # Get a CPU decoder to find frame indices (metadata operations are fast)
+        if decoder_cache is None:
+            decoder_cache = _default_decoder_cache
+        decoder = decoder_cache.get_decoder(str(video_path))
+
+        # Convert timestamps to frame indices
+        metadata = decoder.metadata
+        average_fps = metadata.average_fps
+        frame_indices = [round(ts * average_fps) for ts in timestamps]
+
+        # Request GPU decoding from pool
+        frames_data = gpu_pool.decode_frames(video_path, frame_indices, worker_id)
+
+        # frames_data is on CPU from the pool, convert to float and normalize
+        # frames_data shape is (N, H, W, C), need to convert to (N, C, H, W)
+        closest_frames = frames_data.permute(0, 3, 1, 2).float() / 255.0
+
+        return closest_frames
+
+    # Otherwise use standard CPU decoding
     if decoder_cache is None:
         decoder_cache = _default_decoder_cache
 
